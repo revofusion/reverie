@@ -158,7 +158,7 @@ fn captured_write_query_default_adapter_and_nested_guards_have_no_effects() {
 }
 
 #[test]
-fn guest_reports_the_user_address_limit_the_executor_enforces() {
+fn guest_reports_executor_limits_and_unsupported_shared_backing() {
     // The executor's limit is Linux's on a four-level x86-64 kernel, which is
     // what a tool's model of a guest range check assumes.
     assert_eq!(
@@ -203,6 +203,21 @@ fn guest_reports_the_user_address_limit_the_executor_enforces() {
         <_ as Guest<Lower>>::user_address_limit(&guest.into_guest()).unwrap(),
         expected
     );
+    assert!(guest.local_state().is_some());
+    assert!(!guest.supports_shared_backing());
+    let mut nested = guest.into_guest();
+    assert!(nested.local_state().is_some());
+    assert!(!<_ as Guest<Lower>>::supports_shared_backing(&nested));
+    let error = futures::executor::block_on(<_ as Guest<Lower>>::map_shared_backing(
+        &mut nested,
+        std::fs::File::open("/dev/null").unwrap().into(),
+        None,
+        4096,
+        libc::PROT_READ,
+        libc::MAP_SHARED,
+    ))
+    .unwrap_err();
+    assert_eq!(error.into_errno().unwrap(), Errno::ENOSYS);
     assert!(signal.lock().unwrap().is_none());
     assert!(starts.lock().unwrap().is_empty());
 }

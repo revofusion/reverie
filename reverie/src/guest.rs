@@ -399,6 +399,67 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     /// thread.
     fn memory(&self) -> Self::Memory;
 
+    /// Whether this executor can import an owned host file as shared guest memory.
+    /// Unsupported backends must not emulate this by copying the file's bytes.
+    fn supports_shared_backing(&self) -> bool {
+        false
+    }
+
+    /// Map a retained host backing directly into this guest address space.
+    ///
+    /// Consumes the descriptor without exposing a descriptor to guest code.
+    /// A backend may use temporary guest descriptors only while all guest code
+    /// is quiescent and must close them before resuming it. Native ptrace
+    /// requires the Tool's serialized-execution contract and permission to use
+    /// `pidfd_open`/`pidfd_getfd`; no shared PID or network namespace is needed.
+    /// The mapping shares the backing's bytes at offset zero and retains its
+    /// ownership until unmapping or address-space teardown, including across
+    /// fork. `address`, `length`, `prot`, and `flags` have mmap placement and
+    /// protection meanings; `flags` must include `MAP_SHARED`. Backends may
+    /// explicitly refuse unsupported flags or protections. The caller must keep
+    /// the backing large enough for the page-rounded mapping's lifetime.
+    ///
+    /// Returns the guest virtual address, or `ENOSYS` on unsupported executors.
+    async fn map_shared_backing(
+        &mut self,
+        _backing: std::os::fd::OwnedFd,
+        _address: Option<u64>,
+        _length: usize,
+        _prot: i32,
+        _flags: i32,
+    ) -> Result<u64, Error> {
+        Err(Errno::ENOSYS.into())
+    }
+
+    /// Pin the exact open-file description at this guest's owned stop.
+    ///
+    /// The pin survives close/reuse of `fd`; its facts describe capture, not
+    /// current state after an await. Native ptrace requires serialized execution
+    /// and authenticated native descriptor custody. Other executors return
+    /// `ENOSYS`, rather than reopening a path or emulating a lock.
+    async fn pin_flock(&mut self, _fd: i32) -> Result<crate::PinnedFlock, Error> {
+        Err(Errno::ENOSYS.into())
+    }
+
+    /// Execute a kernel flock on the pinned OFD in this guest process.
+    ///
+    /// Accepts only `LOCK_SH | LOCK_NB`, `LOCK_EX | LOCK_NB`, `LOCK_UN`, or
+    /// `LOCK_UN | LOCK_NB`; invalid/blocking operations return `EINVAL` on a
+    /// supporting backend. Never locks from the tracer: Linux's lock-owner PID
+    /// remains the guest's. Temporary imported descriptors are closed before
+    /// returning or admitting another guest. Cancellation during import or
+    /// ambiguous cleanup terminates the trace rather than leaking descriptors
+    /// into surviving threads. The flock's own kernel errors, including
+    /// contention, are returned unchanged; transport errors fail the operation
+    /// rather than masquerading as contention. Unsupported executors return `ENOSYS`.
+    async fn flock_pinned(
+        &mut self,
+        _pin: &crate::PinnedFlock,
+        _operation: i32,
+    ) -> Result<i64, Error> {
+        Err(Errno::ENOSYS.into())
+    }
+
     /// Execute one synchronous syscall on behalf of the Tool, on the calling
     /// operating-system thread. This is a host operation, not guest injection:
     /// the syscall number, six arguments, result and errno pass through unchanged.
@@ -835,6 +896,16 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     /// delivered with it, as in [`crate::SignalEvent`]. `None` outside that
     /// callback, and where the backend cannot read it.
     fn signal_info(&self) -> Option<[u8; crate::SIGNAL_INFO_SIZE]> {
+        None
+    }
+
+    /// The kernel siginfo captured at a signal-delivery stop which interrupted
+    /// a private injection and remains in the backend's held slot. This is a
+    /// read-only custody observation, not permission to deliver or drop it.
+    /// Unlike `signal_info`, this can be read during the interrupted syscall
+    /// callback, before the signal callback. Unsupported backends, unidentified
+    /// holds and already-reported copies return None.
+    fn held_signal_info(&self) -> Option<[u8; crate::SIGNAL_INFO_SIZE]> {
         None
     }
 
@@ -1596,6 +1667,10 @@ where
     G: Guest<U> + ?Sized,
     U: Tool,
 {
+    fn local_state(&self) -> Option<&U::GlobalState> {
+        self.inner.local_state()
+    }
+
     async fn send_rpc(
         &self,
         message: <U::GlobalState as GlobalTool>::Request,
@@ -1626,6 +1701,35 @@ where
 {
     type Memory = G::Memory;
     type Stack = G::Stack;
+
+    fn supports_shared_backing(&self) -> bool {
+        self.inner.supports_shared_backing()
+    }
+
+    async fn map_shared_backing(
+        &mut self,
+        backing: std::os::fd::OwnedFd,
+        address: Option<u64>,
+        length: usize,
+        prot: i32,
+        flags: i32,
+    ) -> Result<u64, Error> {
+        self.inner
+            .map_shared_backing(backing, address, length, prot, flags)
+            .await
+    }
+
+    async fn pin_flock(&mut self, fd: i32) -> Result<crate::PinnedFlock, Error> {
+        self.inner.pin_flock(fd).await
+    }
+
+    async fn flock_pinned(
+        &mut self,
+        pin: &crate::PinnedFlock,
+        operation: i32,
+    ) -> Result<i64, Error> {
+        self.inner.flock_pinned(pin, operation).await
+    }
 
     fn tid(&self) -> Pid {
         self.inner.tid()
@@ -1881,6 +1985,9 @@ where
     fn signal_info(&self) -> Option<[u8; crate::SIGNAL_INFO_SIZE]> {
         self.inner.signal_info()
     }
+    fn held_signal_info(&self) -> Option<[u8; crate::SIGNAL_INFO_SIZE]> {
+        self.inner.held_signal_info()
+    }
     fn set_signal_info(&mut self, info: [u8; crate::SIGNAL_INFO_SIZE]) -> Result<(), Errno> {
         self.inner.set_signal_info(info)
     }
@@ -2068,6 +2175,10 @@ where
     G: Guest<U> + ?Sized,
     U: Tool,
 {
+    fn local_state(&self) -> Option<&U::GlobalState> {
+        self.inner.local_state()
+    }
+
     async fn send_rpc(
         &self,
         message: <U::GlobalState as GlobalTool>::Request,
@@ -2096,6 +2207,35 @@ where
 {
     type Memory = G::Memory;
     type Stack = G::Stack;
+
+    fn supports_shared_backing(&self) -> bool {
+        self.inner.supports_shared_backing()
+    }
+
+    async fn map_shared_backing(
+        &mut self,
+        backing: std::os::fd::OwnedFd,
+        address: Option<u64>,
+        length: usize,
+        prot: i32,
+        flags: i32,
+    ) -> Result<u64, Error> {
+        self.inner
+            .map_shared_backing(backing, address, length, prot, flags)
+            .await
+    }
+
+    async fn pin_flock(&mut self, fd: i32) -> Result<crate::PinnedFlock, Error> {
+        self.inner.pin_flock(fd).await
+    }
+
+    async fn flock_pinned(
+        &mut self,
+        pin: &crate::PinnedFlock,
+        operation: i32,
+    ) -> Result<i64, Error> {
+        self.inner.flock_pinned(pin, operation).await
+    }
 
     fn tid(&self) -> Pid {
         self.inner.tid()

@@ -1525,6 +1525,15 @@ impl Tool for () {
 /// inter-process communication).
 #[async_trait]
 pub trait GlobalRPC<G: GlobalTool>: Sync {
+    /// Borrow the global state when it lives in this host process.
+    ///
+    /// This optional, local-only capability does not transfer resources through
+    /// RPC. Remote backends return `None`; callers must not serialize host
+    /// pointers or descriptor numbers as a substitute.
+    fn local_state(&self) -> Option<&G> {
+        None
+    }
+
     /// Send an RPC message to wherever the global state is stored, synchronously
     /// blocks the current thread until a response is received.
     async fn send_rpc(&self, message: G::Request) -> G::Response;

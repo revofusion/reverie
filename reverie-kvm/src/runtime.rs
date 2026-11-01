@@ -659,6 +659,22 @@ trait GuestSyscallExecutor<T: Tool>:
         false
     }
 
+    fn supports_shared_backing(&self) -> bool {
+        false
+    }
+
+    fn map_shared_backing(
+        &mut self,
+        _memory: &GuestMemory,
+        _backing: std::os::fd::OwnedFd,
+        _address: Option<u64>,
+        _length: usize,
+        _prot: i32,
+        _flags: i32,
+    ) -> Result<i64> {
+        Ok(-i64::from(libc::ENOSYS))
+    }
+
     fn failure_subscription(&self) -> Option<crate::failure::FailureSubscription> {
         None
     }
@@ -1694,6 +1710,26 @@ where
     T::GlobalState: 'static,
     <T::GlobalState as GlobalTool>::Config: 'static,
 {
+    fn supports_shared_backing(&self) -> bool {
+        true
+    }
+
+    fn map_shared_backing(
+        &mut self,
+        memory: &GuestMemory,
+        backing: std::os::fd::OwnedFd,
+        address: Option<u64>,
+        length: usize,
+        prot: i32,
+        flags: i32,
+    ) -> Result<i64> {
+        if self.thread_ended_by_its_group() {
+            return Err(Error::TerminalReadCancelled);
+        }
+        self.executor
+            .map_shared_backing(memory, backing, address, length, prot, flags)
+    }
+
     fn read_clock(&self) -> Result<u64> {
         self.backend.vcpu.read_clock()
     }
@@ -1957,6 +1993,10 @@ struct KvmGlobal<'a, G: GlobalTool> {
 
 #[reverie::tool]
 impl<G: GlobalTool> GlobalRPC<G> for KvmGlobal<'_, G> {
+    fn local_state(&self) -> Option<&G> {
+        Some(self.state)
+    }
+
     async fn send_rpc(&self, message: G::Request) -> G::Response {
         self.state.receive_rpc(self.tid, message).await
     }
@@ -2208,6 +2248,10 @@ impl<'a, T: Tool> KvmGuest<'a, T> {
 
 #[reverie::tool]
 impl<T: Tool> GlobalRPC<T::GlobalState> for KvmGuest<'_, T> {
+    fn local_state(&self) -> Option<&T::GlobalState> {
+        Some(self.global_state)
+    }
+
     async fn send_rpc(
         &self,
         message: <T::GlobalState as GlobalTool>::Request,
@@ -2312,6 +2356,85 @@ const INSTRUCTION_OFFSET_REFUSAL: &str = "the KVM backend delivers a precise tim
 
 #[reverie::tool]
 impl<T: Tool> Guest<T> for KvmGuest<'_, T> {
+    fn supports_shared_backing(&self) -> bool {
+        self.executor.supports_shared_backing()
+    }
+
+    async fn map_shared_backing(
+        &mut self,
+        backing: std::os::fd::OwnedFd,
+        address: Option<u64>,
+        length: usize,
+        prot: i32,
+        flags: i32,
+    ) -> std::result::Result<u64, reverie::Error> {
+        self.hold_timer_refusal().await;
+        self.admit_ordinary_operation().await;
+        if !self.executor.supports_shared_backing()
+            || self.notifying_dequeue
+            || self.observation_lease.is_some()
+            || self.stack_checked_out.load(Ordering::Acquire)
+        {
+            return Err(Errno::ENOSYS.into());
+        }
+        // Admission uses the equivalent mmap operation, but its descriptor is
+        // never looked up or dispatched. Ownership travels only through the
+        // local executor hook below.
+        let request = SyscallRequest::new(
+            libc::SYS_mmap as u64,
+            [
+                address.unwrap_or(0),
+                length as u64,
+                prot as u64,
+                flags as u64,
+                u64::MAX,
+                0,
+            ],
+        );
+        if !self.executor.ordinary_injection_allowed(&request) {
+            if let Some(error) = self.executor.terminal_injection_refusal(&request) {
+                self.record_timer_refusal(error);
+                return std::future::pending().await;
+            }
+            return Err(Errno::ENOSYS.into());
+        }
+        self.executor.invalidate_polled_read_attempt();
+        if let Err(errno) = self.executor.prepare_signal_effects() {
+            let error = self
+                .executor
+                .with_signal_effects(Error::Reverie(errno.into()), None);
+            self.signal_handler(HandlerSignal::RuntimeError(error));
+            return std::future::pending().await;
+        }
+        self.admit_ordinary_operation().await;
+        let raw = match self.executor.map_shared_backing(
+            &self.memory,
+            backing,
+            address,
+            length,
+            prot,
+            flags,
+        ) {
+            Ok(raw) => raw,
+            Err(Error::TerminalReadCancelled) => match self.cancel_current_thread().await {},
+            Err(error) => {
+                let error = self.executor.with_signal_effects(error, None);
+                self.signal_handler(HandlerSignal::RuntimeError(error));
+                return std::future::pending().await;
+            }
+        };
+        if !self.executor.signal_effects_settled()
+            && let Err(error) = self.complete_signal_effects(Some(raw)).await
+        {
+            self.signal_handler(HandlerSignal::RuntimeError(error));
+            return std::future::pending().await;
+        }
+        self.resume_ordinary_operation(Some(raw)).await;
+        raw_to_result(raw)
+            .map(|address| address as u64)
+            .map_err(Into::into)
+    }
+
     fn has_cpuid_interception(&self) -> bool {
         self.executor.has_cpuid_interception()
     }

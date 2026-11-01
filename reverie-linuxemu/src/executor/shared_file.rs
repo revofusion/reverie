@@ -20,6 +20,178 @@ fn unsupported_mmap(reason: &'static str) -> crate::Error {
     }
 }
 
+impl ElfExecutor {
+    /// Import a host-owned backing without exposing a descriptor in the guest.
+    ///
+    /// Supports offset-zero, non-executable `MAP_SHARED` views and optional
+    /// `MAP_FIXED`/`MAP_FIXED_NOREPLACE` placement. Publication uses the same
+    /// quiescence, synchronous-MMU, rollback and retained-fork ownership as
+    /// ordinary shared file mappings. The owner must not truncate the backing
+    /// below the page-rounded extent while any view remains live.
+    ///
+    /// Linux argument errors are negative errno results; backend invariant
+    /// failures remain typed run failures, as with `execute_checked`.
+    pub fn map_shared_backing(
+        &mut self,
+        memory: &GuestMemory,
+        backing: std::os::fd::OwnedFd,
+        address: Option<u64>,
+        length: usize,
+        prot: i32,
+        flags: i32,
+    ) -> crate::Result<i64> {
+        if let Some(receipt) = self.state.consumed_child_wait.as_ref() {
+            return Err(crate::Error::ChildWaitLedgerEffectPending {
+                parent: self.admitted_signal_identity().process,
+                child_pid: receipt.child_pid(),
+            });
+        }
+        self.check_parent_death_failure()?;
+        self.bind_address_space(memory);
+        self.parent_death_injection_preflight(&SyscallRequest::new(
+            libc::SYS_mmap as u64,
+            [
+                address.unwrap_or(0),
+                length as u64,
+                prot as u64,
+                flags as u64,
+                u64::MAX,
+                0,
+            ],
+        ))?;
+        let result = import_shared_backing(
+            memory,
+            &mut self.state,
+            backing,
+            address,
+            length,
+            prot,
+            flags,
+        )
+        .map_err(|error| memory.capture_shared_file_error(error));
+        if let Some(failure) = memory.entry_gate().pending_failure() {
+            return Err(failure.error());
+        }
+        result
+    }
+}
+
+fn import_shared_backing(
+    memory: &GuestMemory,
+    state: &mut LoadedStaticElf,
+    backing: std::os::fd::OwnedFd,
+    address: Option<u64>,
+    length: usize,
+    prot: i32,
+    flags: i32,
+) -> crate::Result<i64> {
+    let supported = libc::MAP_SHARED | libc::MAP_FIXED | libc::MAP_FIXED_NOREPLACE;
+    if flags & !supported != 0 || prot & !(libc::PROT_READ | libc::PROT_WRITE) != 0 {
+        return Ok(negative_errno(libc::ENOSYS));
+    }
+    if flags & libc::MAP_SHARED == 0 || length == 0 {
+        return Ok(negative_errno(libc::EINVAL));
+    }
+    let Some(length) = align_up(length as u64, PAGE_SIZE) else {
+        return Ok(negative_errno(libc::ENOMEM));
+    };
+    if libc::off_t::try_from(length).is_err() {
+        return Ok(negative_errno(libc::ENOMEM));
+    }
+    let requested = address.unwrap_or(0);
+    let noreplace = flags & libc::MAP_FIXED_NOREPLACE != 0;
+    let fixed = flags & libc::MAP_FIXED != 0 || noreplace;
+    if let Some(errno) = super::fixed_mapping_address_error(fixed, requested, length) {
+        return Ok(negative_errno(errno));
+    }
+    let file = std::fs::File::from(backing);
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => return Ok(io_error(error)),
+    };
+    if !metadata.is_file() {
+        return Ok(negative_errno(libc::ENODEV));
+    }
+    if metadata.len() < length {
+        return Ok(negative_errno(libc::EINVAL));
+    }
+    let status = match file_status_flags(&file) {
+        Ok(status) => status,
+        Err(error) => return Ok(error),
+    };
+    if status & libc::O_PATH != 0 {
+        return Ok(negative_errno(libc::EBADF));
+    }
+    let writable = prot & libc::PROT_WRITE != 0;
+    if !matches!(status & libc::O_ACCMODE, libc::O_RDONLY | libc::O_RDWR)
+        || (writable && status & libc::O_ACCMODE != libc::O_RDWR)
+    {
+        return Ok(negative_errno(libc::EACCES));
+    }
+    // SAFETY: file owns the live descriptor; F_GET_SEALS takes no pointer.
+    let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+    if seals < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINVAL) {
+            return Ok(io_error(error));
+        }
+    }
+    let sealed_write = seals >= 0 && seals & (libc::F_SEAL_WRITE | libc::F_SEAL_FUTURE_WRITE) != 0;
+    if writable && sealed_write {
+        return Ok(negative_errno(libc::EPERM));
+    }
+
+    let allocation = memory.allocation_guard();
+    let mut cursors = memory
+        .allocation_cursors()
+        .unwrap_or_else(|| AllocationCursors::from_elf(state));
+    state.program_break = cursors.program_break;
+    state.mmap_base = cursors.mmap_base;
+    state.mmap_next = cursors.mmap_next;
+    state.mmap_limit = cursors.mmap_limit;
+    let kind = super::MappingKind::RegularFile(0);
+    let address = if fixed {
+        memory.user_range_to_guest(requested, length)
+    } else {
+        super::place_mapping(memory, state, length, requested, kind, false)
+    };
+    let Some(address) = address else {
+        return Ok(negative_errno(libc::ENOMEM));
+    };
+    let Some(end) = address.checked_add(length) else {
+        return Ok(negative_errno(libc::ENOMEM));
+    };
+    // The owned backing was validated above, not through a guest descriptor.
+    if noreplace && memory.find_unmapped_user_range(address, end, length) != Some(address) {
+        return Ok(negative_errno(libc::EEXIST));
+    }
+    if address < BOOT_RESERVED_END || end > state.mmap_limit {
+        return Ok(negative_errno(libc::ENOMEM));
+    }
+    if !fixed {
+        cursors.mmap_next = cursors.mmap_next.max(end);
+    }
+    let Ok(length) = usize::try_from(length) else {
+        return Ok(negative_errno(libc::ENOMEM));
+    };
+    memory.publish_shared_file_range(
+        allocation,
+        SharedFileRangePlan {
+            address,
+            length,
+            file: file.into(),
+            offset: 0,
+            readable: prot != libc::PROT_NONE,
+            writable,
+            max_writable: status & libc::O_ACCMODE == libc::O_RDWR && !sealed_write,
+            cursors: Some(cursors),
+        },
+    )?;
+    memory.record_page_backing(address, length as u64, Some(0), false);
+    state.mmap_next = cursors.mmap_next;
+    Ok(memory.physical_to_user(address).unwrap_or(address) as i64)
+}
+
 /// A reserved name only denies an unsupported private object; it never proves
 /// that an object is an authenticated carrier or an ordinary filesystem file.
 fn classify_shared_mmap_file(

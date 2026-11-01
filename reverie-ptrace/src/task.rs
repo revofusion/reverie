@@ -170,6 +170,7 @@ use reserved_input::NativeInputCall;
 mod native_syscall;
 use native_syscall::DeferredNativeCall;
 use native_syscall::NativeCallContext;
+mod shared_backing;
 
 #[cfg(test)]
 mod thread_state_ready_tests;
@@ -15143,12 +15144,49 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
     type Memory = crate::tool_memory::ToolMemory;
     type Stack = GuestStack;
 
+    fn supports_shared_backing(&self) -> bool {
+        cfg!(target_arch = "x86_64") && L::enforces_serialized_execution(&self.global_state.cfg)
+    }
+
+    async fn map_shared_backing(
+        &mut self,
+        backing: std::os::fd::OwnedFd,
+        address: Option<u64>,
+        length: usize,
+        prot: i32,
+        flags: i32,
+    ) -> Result<u64, reverie::Error> {
+        self.import_shared_backing(backing, address, length, prot, flags)
+            .await
+    }
+
+    async fn pin_flock(&mut self, fd: i32) -> Result<reverie::PinnedFlock, reverie::Error> {
+        self.capture_flock(fd)
+    }
+
+    async fn flock_pinned(
+        &mut self,
+        pin: &reverie::PinnedFlock,
+        operation: i32,
+    ) -> Result<i64, reverie::Error> {
+        self.execute_pinned_flock(pin, operation).await
+    }
+
     fn pidfd_self_spelling(&self) -> reverie::PidfdSelfSpelling {
         self.global_state.pidfd_self_spelling
     }
 
     fn signal_info(&self) -> Option<[u8; reverie::SIGNAL_INFO_SIZE]> {
         self.reported_signal.and_then(|(_, info)| info)
+    }
+
+    fn held_signal_info(&self) -> Option<[u8; reverie::SIGNAL_INFO_SIZE]> {
+        self.pending_signal_taken
+            .as_ref()
+            .filter(|taken| {
+                Some(taken.signal) == self.pending_signal && !self.pending_signal_reported
+            })
+            .map(|taken| taken.bytes)
     }
 
     fn set_signal_info(&mut self, info: [u8; reverie::SIGNAL_INFO_SIZE]) -> Result<(), Errno> {
@@ -15727,6 +15765,10 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
 
 #[async_trait]
 impl<L: Tool + 'static> GlobalRPC<L::GlobalState> for TracedTask<L> {
+    fn local_state(&self) -> Option<&L::GlobalState> {
+        Some(&self.global_state.gs_ref)
+    }
+
     async fn send_rpc<'a>(
         &'a self,
         args: <L::GlobalState as GlobalTool>::Request,
@@ -15746,6 +15788,10 @@ struct WrappedFrom<'a, G: GlobalTool>(Tid, &'a GlobalState<G>);
 
 #[async_trait]
 impl<'a, G: GlobalTool> GlobalRPC<G> for WrappedFrom<'a, G> {
+    fn local_state(&self) -> Option<&G> {
+        Some(&self.1.gs_ref)
+    }
+
     async fn send_rpc(&self, args: G::Request) -> G::Response {
         // In debugging mode we round-trip through a serialized representation
         // to make sure it works.

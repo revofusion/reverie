@@ -59,6 +59,19 @@ pub enum PmuValidationError {
         /// The CPUID model.
         model: u8,
     },
+    /// A hybrid CPU's event cannot be selected safely from family/model alone.
+    #[cfg(target_arch = "x86_64")]
+    #[error(
+        "Intel Raptor Lake requires affinity to exactly one P-core logical CPU \
+        (CPUID core type 0x40); observed core type {core_type:#x} and \
+        {allowed_cpus} allowed CPUs. Pin the tracing process to a P-core before launch."
+    )]
+    HybridCpuRequiresPinnedPerformanceCore {
+        /// CPUID.1A:EAX[31:24].
+        core_type: u8,
+        /// Number of logical CPUs in the calling thread's affinity.
+        allowed_cpus: u32,
+    },
 
     #[cfg(target_arch = "x86_64")]
     /// CPUID did not report the vendor or features.
@@ -275,14 +288,9 @@ impl PmuConfig {
     /// cannot be read ([`PmuValidationError::CouldNotReadCpuInfo`]).
     #[cfg(target_arch = "x86_64")]
     pub fn new() -> Result<Self, PmuValidationError> {
-        let features = raw_cpuid::CpuId::new()
-            .get_feature_info()
-            .ok_or(PmuValidationError::CouldNotReadCpuInfo)?;
-        Ok(
-            Self::for_family_model(features.family_id(), features.model_id())?
-                .with_env_overrides()
-                .with_recorded_skid_margin(),
-        )
+        Ok(Self::from_profile(detect_host_pmu_profile()?)
+            .with_env_overrides()
+            .with_recorded_skid_margin())
     }
 
     /// The PMU configuration of an x86 CPU with this family and model, without
@@ -330,13 +338,18 @@ impl PmuConfig {
     #[cfg(target_arch = "x86_64")]
     #[doc(hidden)]
     pub fn try_from_family_model(family_id: u8, model_id: u8) -> Option<Self> {
-        crate::pmu::PmuProfile::for_family_model(family_id, model_id).map(|profile| Self {
+        crate::pmu::PmuProfile::for_family_model(family_id, model_id).map(Self::from_profile)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn from_profile(profile: crate::pmu::PmuProfile) -> Self {
+        Self {
             rcb_event: profile.raw_rcb_event(),
             skid_margin: profile.default_skid_margin(),
             skid_margin_override: None,
             skid_latency_budget_ns: DEFAULT_SKID_LATENCY_BUDGET_NS,
             halve_stages: HALVE_STAGES_BY_DEFAULT,
-        })
+        }
     }
 
     /// Overrides the processor-specific skid margin while preserving the detected PMU event.
@@ -740,16 +753,86 @@ pub fn set_skid_margin_override(skid_margin: u64) -> Result<(), u64> {
 }
 
 /// Whether this host's CPU has a PMU profile, the precondition for a ptrace
-/// timer. It only reads CPUID and the profile table: it builds no
-/// configuration, applies no override and writes nothing, so a tool can ask
-/// before it starts and disable or refuse its timeslice rather than run
-/// without the timer it asked for.
+/// timer. Reads CPUID, the profile table and, on supported hybrid CPUs, the
+/// calling thread's affinity. Builds no configuration and applies no override.
 #[cfg(target_arch = "x86_64")]
 pub fn host_pmu_profile() -> Result<(), PmuValidationError> {
-    let features = raw_cpuid::CpuId::new()
+    detect_host_pmu_profile().map(drop)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn detect_host_pmu_profile() -> Result<crate::pmu::PmuProfile, PmuValidationError> {
+    let cpuid = raw_cpuid::CpuId::new();
+    let features = cpuid
         .get_feature_info()
         .ok_or(PmuValidationError::CouldNotReadCpuInfo)?;
-    PmuConfig::for_family_model(features.family_id(), features.model_id()).map(drop)
+    let (family, model) = (features.family_id(), features.model_id());
+    if let Some(profile) = crate::pmu::PmuProfile::pinned_intel_p_core(family, model) {
+        let vendor = cpuid
+            .get_vendor_info()
+            .ok_or(PmuValidationError::CouldNotReadCpuInfo)?;
+        if vendor.as_str() != "GenuineIntel" {
+            return Err(PmuValidationError::UnknownCpuVendor(
+                vendor.as_str().to_owned(),
+            ));
+        }
+        // The event is P-core-only. A singleton affinity prevents migration to
+        // an E-core between CPUID and counter setup; worker threads inherit it.
+        // SAFETY: cpu_set_t is a plain bitset initialized before the syscall.
+        let mut affinity: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        // SAFETY: affinity is writable for the supplied size; pid 0 is self.
+        if unsafe { libc::sched_getaffinity(0, std::mem::size_of_val(&affinity), &mut affinity) }
+            != 0
+        {
+            return Err(PmuValidationError::UnexpectedTestingErrnoError {
+                errno: Errno::last(),
+                msg: "reading CPU affinity for hybrid PMU qualification",
+            });
+        }
+        // CPUID is available on x86-64; an absent leaf gives type zero.
+        let core_type = if std::arch::x86_64::__cpuid(0).eax >= 0x1A {
+            (std::arch::x86_64::__cpuid_count(0x1A, 0).eax >> 24) as u8
+        } else {
+            0
+        };
+        // SAFETY: affinity is the initialized bitset returned by the kernel.
+        let allowed_cpus = unsafe { libc::CPU_COUNT(&affinity) } as u32;
+        require_pinned_performance_core(core_type, allowed_cpus)?;
+        return Ok(profile);
+    }
+    crate::pmu::PmuProfile::for_family_model(family, model)
+        .ok_or(PmuValidationError::UnsupportedCpu { family, model })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn require_pinned_performance_core(
+    core_type: u8,
+    allowed_cpus: u32,
+) -> Result<(), PmuValidationError> {
+    if core_type == 0x40 && allowed_cpus == 1 {
+        Ok(())
+    } else {
+        Err(PmuValidationError::HybridCpuRequiresPinnedPerformanceCore {
+            core_type,
+            allowed_cpus,
+        })
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod hybrid_admission_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_e_cores_unknown_core_types_and_migratable_affinities() {
+        assert!(require_pinned_performance_core(0x40, 1).is_ok());
+        for (core_type, allowed_cpus) in [(0x20, 1), (0, 1), (0x40, 0), (0x40, 2)] {
+            assert!(matches!(
+                require_pinned_performance_core(core_type, allowed_cpus),
+                Err(PmuValidationError::HybridCpuRequiresPinnedPerformanceCore { .. })
+            ));
+        }
+    }
 }
 
 /// Every aarch64 CPU gets a configuration ([`PmuConfig::new`]).

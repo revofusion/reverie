@@ -12206,6 +12206,7 @@ fn repair_prctl_required_kvm_is_not_optional() {
         "a_vfork_child_creating_a_thread_is_refused_by_name",
         "a_parent_thread_replacing_a_page_the_vfork_child_changed_is_refused_by_name",
         "a_fork_copies_every_page_its_parent_can_read_like_native",
+        "imported_shared_backing_is_visible_and_inherited_by_guest_fork",
         "shared_anonymous_fork_shares_one_object_across_fork_unmap_and_exec_like_native",
         "pdeathsig::unchanged_six_check_state_matches_native_controlled",
         "pdeathsig::direct_host_and_unopted_control_preserve_nonzero_refusal",
@@ -22957,6 +22958,113 @@ fn a_fork_copies_every_page_its_parent_can_read_like_native() {
         );
         assert_eq!(stderr, native.stderr, "{TEST} mode={name}");
         eprintln!("{TEST} completed {name}");
+    }
+}
+
+#[derive(Default)]
+struct ImportedBackingTool;
+
+#[reverie::tool]
+impl Tool for ImportedBackingTool {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    fn subscriptions(_: &()) -> Subscription {
+        let mut subscriptions = Subscription::none();
+        // This fixture uses getppid only as a request to its Tool, not as a
+        // claim that importing a backing is a Linux syscall.
+        subscriptions.syscalls([Sysno::getppid]);
+        subscriptions
+    }
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        _: Syscall,
+    ) -> Result<i64, reverie::Error> {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::fs::FileExt;
+
+        assert!(guest.supports_shared_backing());
+        assert!(guest.local_state().is_some());
+        // SAFETY: fixed nul-terminated name; the resulting fd is owned once.
+        let raw = unsafe { libc::memfd_create(c"tool-import".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(raw >= 0);
+        let file = unsafe { std::fs::File::from_raw_fd(raw) };
+        file.set_len(4096).unwrap();
+        file.write_at(&[0x5a], 0).unwrap();
+        // No source descriptor remains outside the published backing.
+        Ok(guest
+            .map_shared_backing(
+                file.into(),
+                None,
+                56,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+            )
+            .await? as i64)
+    }
+}
+
+#[test]
+fn imported_shared_backing_is_visible_and_inherited_by_guest_fork() {
+    const TEST: &str = "imported_shared_backing_is_visible_and_inherited_by_guest_fork";
+    if !leader_self_exec_bounded(TEST) {
+        return;
+    }
+    let directory = TestDirectory::new();
+    let program = compile_c_program(
+        &directory.0,
+        "imported-shared-backing",
+        r#"
+#define _GNU_SOURCE
+#include <stdint.h>
+#include <stdio.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+int main(void) {
+    long address = syscall(SYS_getppid);
+    if (address <= 0) return 1;
+    volatile unsigned char *bytes = (void *)(uintptr_t)address;
+    if (bytes[0] != 0x5a) return 2;
+    bytes[0] = 17;
+    pid_t child = fork();
+    if (child < 0) return 3;
+    if (child == 0) {
+        if (bytes[0] != 17) _exit(4);
+        bytes[0] = 42;
+        _exit(0);
+    }
+    int status = 0;
+    if (waitpid(child, &status, 0) != child || status != 0) return 5;
+    if (bytes[0] != 42) return 6;
+    if (munmap((void *)(uintptr_t)address, 4096) != 0) return 7;
+    puts("imported backing shared across fork");
+    return 0;
+}
+"#,
+    );
+    let image = std::fs::read(&program).unwrap();
+    for ownership in [ThreadOwnership::Host, ThreadOwnership::Tool] {
+        let mut backend = KvmBackend::new(256 * 1024 * 1024).unwrap();
+        backend
+            .install_static_elf_with_context(
+                &image,
+                &[program.to_str().unwrap()],
+                &[],
+                &directory.0,
+            )
+            .unwrap();
+        backend.set_thread_ownership(ownership);
+        let (_, code, stdout, stderr) = futures::executor::block_on(
+            backend.run_static_elf_with_tool::<ImportedBackingTool>((), true),
+        )
+        .unwrap();
+        assert_eq!(code, 0, "ownership={ownership:?}: stderr={stderr:?}");
+        assert!(stderr.is_empty(), "{stderr:?}");
+        assert_eq!(stdout, b"imported backing shared across fork\n");
     }
 }
 

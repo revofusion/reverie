@@ -195,9 +195,10 @@ pub struct BackendCapabilities {
     /// the moment the kernel publishes a guest child process's exit to its
     /// guest parent. Under ptrace that is when the tracer consumes the
     /// process leader's final wait status: the kernel notifies the real parent
-    /// of a traced child only then. A tool can hold its schedule until the
-    /// report, so the parent's exit notification is generated at a
-    /// scheduler-chosen point.
+    /// of a traced child only then. This also proves every thread has exited
+    /// and released its file-table references. A tool can hold its schedule
+    /// until the report, so neither peer I/O nor the parent's notification
+    /// races incomplete process cleanup.
     ///
     /// The report covers every ordinary, initialized process leader whose
     /// final status the tracer consumes, once each, including one killed

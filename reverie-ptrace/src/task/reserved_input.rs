@@ -182,13 +182,13 @@ fn descriptor_facts(
     tid: i32,
     pidfd: &OwnedFd,
     fd: i32,
-) -> Result<PinnedInputDescriptor, InputNativeError> {
+) -> Result<(InputDescriptorFacts, OwnedFd), InputNativeError> {
     let pinned = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), fd, 0) };
     if pinned < 0 {
         return Err(native_error("pidfd_getfd"));
     }
-    // The pin is an actual duplicate, not an O_PATH reopen. Drop closes it before
-    // the synchronous admission observer can return to a yielding callback.
+    // The pin is an actual duplicate, not an O_PATH reopen. Its caller owns
+    // the reference for either a synchronous census or a parked flock.
     let pinned = unsafe { OwnedFd::from_raw_fd(pinned as i32) };
     let same = || {
         let result = unsafe {
@@ -272,7 +272,7 @@ fn descriptor_facts(
             .map_err(|error| io_error("procfd-readlink", error)),
     };
     same()?;
-    Ok(PinnedInputDescriptor::from_native_parts(facts, pinned))
+    Ok((facts, pinned))
 }
 
 fn descriptors(tid: i32) -> Result<Vec<PinnedInputDescriptor>, InputNativeError> {
@@ -302,7 +302,10 @@ fn descriptors(tid: i32) -> Result<Vec<PinnedInputDescriptor>, InputNativeError>
     numbers.sort_unstable();
     numbers
         .into_iter()
-        .map(|fd| descriptor_facts(tid, &pidfd, fd))
+        .map(|fd| {
+            descriptor_facts(tid, &pidfd, fd)
+                .map(|(facts, pin)| PinnedInputDescriptor::from_native_parts(facts, pin))
+        })
         .collect()
 }
 
@@ -678,7 +681,10 @@ impl<L: Tool + 'static> TracedTask<L> {
         Ok(())
     }
 
-    fn authenticate_native_fact_stop(&self, stop: &Stopped) -> Result<(), InputUnavailable> {
+    pub(super) fn authenticate_native_fact_stop(
+        &self,
+        stop: &Stopped,
+    ) -> Result<(), InputUnavailable> {
         let retained = self
             .preinit_generation
             .as_ref()
@@ -690,6 +696,34 @@ impl<L: Tool + 'static> TracedTask<L> {
             ));
         }
         Ok(())
+    }
+
+    pub(super) fn capture_flock(&self, fd: i32) -> Result<reverie::PinnedFlock, reverie::Error> {
+        if !self.supports_shared_backing() {
+            return Err(Errno::ENOSYS.into());
+        }
+        if fd < 0 {
+            return Err(Errno::EBADF.into());
+        }
+        let task = self.assume_stopped();
+        self.authenticate_native_fact_stop(&task)
+            .map_err(|error| anyhow::anyhow!("flock capture requires an owned stop: {error:?}"))?;
+        task.getregs()
+            .map_err(|error| anyhow::anyhow!("flock capture stop unavailable: {error}"))?;
+        let pidfd = shared_backing::task_pidfd(self.tid, self.pid())
+            .map_err(|error| anyhow::anyhow!("cannot open flock capture pidfd: {error}"))?;
+        let (facts, pin) = descriptor_facts(self.tid.as_raw(), &pidfd, fd).map_err(|error| {
+            // Only an actual invalid descriptor is an application error. A
+            // failed custody check must never become a synthetic lock result.
+            if error.operation == "pidfd_getfd" && error.errno == Some(libc::EBADF) {
+                reverie::Error::from(Errno::EBADF)
+            } else {
+                anyhow::anyhow!("cannot pin flock description: {error:?}").into()
+            }
+        })?;
+        task.getregs()
+            .map_err(|error| anyhow::anyhow!("flock capture stop unavailable: {error}"))?;
+        Ok(reverie::PinnedFlock::from_native_parts(facts, pin))
     }
 
     pub(super) fn inspect_input_descriptors(
@@ -808,13 +842,13 @@ impl<L: Tool + 'static> TracedTask<L> {
             )));
         }
         let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as i32) };
-        let facts = descriptor_facts(self.tid.as_raw(), &pidfd, fd).map_err(|error| {
+        let (facts, pin) = descriptor_facts(self.tid.as_raw(), &pidfd, fd).map_err(|error| {
             InputUnavailable::new(format!("input-descriptor-unproved: {error:?}"))
         })?;
         stopped
             .getregs()
             .map_err(|_| InputUnavailable::new("input-stop-unavailable"))?;
-        Ok(facts)
+        Ok(PinnedInputDescriptor::from_native_parts(facts, pin))
     }
 
     fn input_setup_observation(&self, outcome: InputSetupOutcome) -> Result<(), TraceError> {

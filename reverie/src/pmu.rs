@@ -24,6 +24,21 @@ pub struct PmuProfile {
 }
 
 impl PmuProfile {
+    /// Raptor Lake's hybrid package needs core-type and affinity checks before
+    /// selecting an event. Keep it out of the context-free family/model lookup.
+    pub(crate) fn pinned_intel_p_core(family_id: u8, model_id: u8) -> Option<Self> {
+        if (family_id, model_id) != (0x06, 0xB7) {
+            return None;
+        }
+        // rr's IntelRaptorLake P-core profile: BR_INST_RETIRED.COND (C4/11),
+        // not COND_TAKEN (C4/01) or Gracemont's E-core event (C4/7E).
+        // https://github.com/rr-debugger/rr/blob/master/src/PerfCounters.cc
+        Some(Self {
+            rcb_event: 0x5111c4,
+            skid_margin: 125,
+        })
+    }
+
     /// Looks up the existing x86 PMU profile for a CPUID family and model.
     ///
     /// Returns `None` when the family/model pair is not in the profile table.

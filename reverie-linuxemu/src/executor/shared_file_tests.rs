@@ -246,6 +246,167 @@ mod shared_file_dispatch_tests {
         }
     }
 
+    fn imported_backing() -> std::fs::File {
+        // SAFETY: the name is nul-terminated and the returned fd is owned once.
+        let raw = unsafe {
+            libc::memfd_create(
+                c"imported-shared-backing".as_ptr(),
+                libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+            )
+        };
+        assert!(raw >= 0, "memfd_create: {}", std::io::Error::last_os_error());
+        let file = unsafe { std::fs::File::from_raw_fd(raw) };
+        file.set_len(PAGE_SIZE).unwrap();
+        assert_eq!(
+            unsafe {
+                libc::fcntl(
+                    file.as_raw_fd(),
+                    libc::F_ADD_SEALS,
+                    libc::F_SEAL_SHRINK | libc::F_SEAL_GROW,
+                )
+            },
+            0
+        );
+        file
+    }
+
+    #[test]
+    fn imported_shared_backing_survives_source_close_and_snapshot() {
+        let mut f = Fixture::with_linux_layout();
+        let mut executor = f.take_executor();
+        let file = imported_backing();
+        file.write_at(b"initial", 0).unwrap();
+        let descriptors = executor.state.files.len();
+        let first = executor
+            .map_shared_backing(
+                &f.memory,
+                file.try_clone().unwrap().into(),
+                None,
+                56,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+            )
+            .unwrap();
+        assert!(first > 0);
+        let second = executor
+            .map_shared_backing(
+                &f.memory,
+                file.try_clone().unwrap().into(),
+                Some(first as u64 - PAGE_SIZE),
+                PAGE_SIZE as usize,
+                libc::PROT_READ,
+                libc::MAP_SHARED | libc::MAP_FIXED_NOREPLACE,
+            )
+            .unwrap();
+        assert_eq!(second, first - PAGE_SIZE as i64);
+        assert_eq!(executor.state.files.len(), descriptors);
+        let mut bytes = [0; 7];
+        f.memory.user().read(first as u64, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"initial");
+        file.write_at(b"outside", 0).unwrap();
+        f.memory.user().read(second as u64, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"outside");
+        drop(file);
+        f.memory.user().write(first as u64, b"parent!").unwrap();
+        f.memory.user().read(second as u64, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"parent!");
+        assert!(f.memory.entry_gate().single_member_domain_active());
+
+        let child = f.memory.snapshot().unwrap();
+        child.user().write(first as u64, b"child!!").unwrap();
+        f.memory.user().read(second as u64, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"child!!");
+        // Retiring the parent image must not retire the child's retained views.
+        drop(executor);
+        drop(f);
+        child.user().write(first as u64, b"orphan!").unwrap();
+        child.user().read(second as u64, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"orphan!");
+    }
+
+    #[test]
+    fn imported_shared_backing_argument_failures_leave_mapping_unchanged() {
+        let mut f = Fixture::new();
+        let mut executor = f.take_executor();
+        let file = imported_backing();
+        let address = executor
+            .map_shared_backing(
+                &f.memory,
+                file.try_clone().unwrap().into(),
+                None,
+                PAGE_SIZE as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+            )
+            .unwrap() as u64;
+        let before = layout(&f.memory, &executor.state);
+        let fixed = libc::MAP_SHARED | libc::MAP_FIXED;
+        for (requested, length, prot, flags, errno) in [
+            (None, 0, libc::PROT_READ, libc::MAP_SHARED, libc::EINVAL),
+            (None, PAGE_SIZE * 2, libc::PROT_READ, libc::MAP_SHARED, libc::EINVAL),
+            (None, PAGE_SIZE, libc::PROT_EXEC, libc::MAP_SHARED, libc::ENOSYS),
+            (None, PAGE_SIZE, libc::PROT_READ, libc::MAP_PRIVATE, libc::ENOSYS),
+            (Some(address + 1), PAGE_SIZE, libc::PROT_READ, fixed, libc::EINVAL),
+            (Some(executor.state.mmap_limit), PAGE_SIZE, libc::PROT_READ, fixed, libc::ENOMEM),
+            (
+                Some(address),
+                PAGE_SIZE,
+                libc::PROT_READ,
+                libc::MAP_SHARED | libc::MAP_FIXED_NOREPLACE,
+                libc::EEXIST,
+            ),
+        ] {
+            assert_eq!(
+                executor
+                    .map_shared_backing(
+                        &f.memory,
+                        file.try_clone().unwrap().into(),
+                        requested,
+                        length as usize,
+                        prot,
+                        flags,
+                    )
+                    .unwrap(),
+                negative_errno(errno)
+            );
+            assert_eq!(layout(&f.memory, &executor.state), before);
+        }
+        let error = executor
+            .execute_checked(
+                &SyscallRequest::new(
+                    libc::SYS_clone as u64,
+                    [(libc::CLONE_VM | libc::SIGCHLD) as u64, 0, 0, 0, 0, 0],
+                ),
+                &f.memory,
+            )
+            .unwrap_err();
+        capability(
+            &error,
+            "CLONE_VM/thread creation",
+            "ordinary shared-file views require one vCPU per address space",
+        );
+    }
+
+    #[test]
+    fn imported_shared_backing_preserves_synchronous_mmu_refusal() {
+        let mut f = Fixture::new();
+        let mut executor = f.take_executor();
+        f.memory.record_kvm_sync_mmu(false).unwrap();
+        let before = layout(&f.memory, &executor.state);
+        let error = executor
+            .map_shared_backing(
+                &f.memory,
+                imported_backing().into(),
+                None,
+                PAGE_SIZE as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+            )
+            .unwrap_err();
+        assert!(matches!(error.primary(), crate::Error::SynchronousMmuUnsupported));
+        assert_eq!(layout(&f.memory, &executor.state), before);
+    }
+
     #[test]
     fn pipe2_truncated_shared_copy_notifies_after_actual_file_table_unlock() {
         struct Observation {

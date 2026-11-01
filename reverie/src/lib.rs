@@ -77,6 +77,7 @@ mod inherited_input;
 /// Shared Linux perf event mechanics; no tracer or timer policy.
 pub mod perf;
 pub mod pidfd_self;
+mod pinned_flock;
 #[cfg(target_arch = "x86_64")]
 pub mod pmu;
 /// Process-wide PMU configuration shared by counters and precise timers.
@@ -84,6 +85,7 @@ pub mod pmu_config;
 pub use in_guest_rcb::InGuestRcbCounter;
 pub use perf::is_perf_supported;
 pub use pidfd_self::PidfdSelfSpelling;
+pub use pinned_flock::PinnedFlock;
 mod mapping_capture;
 pub mod native_syscall;
 mod process_signal_control;
